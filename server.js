@@ -5,7 +5,9 @@ import axios from 'axios';
 const {
   EFI_CLIENT_ID,
   EFI_CLIENT_SECRET,
-  EFI_CERTIFICATE_BASE64,
+  EFI_CERTIFICATE_BASE64, // opcional (P12 em base64)
+  EFI_CERT_PEM,           // opcional (certificado PEM completo)
+  EFI_KEY_PEM,            // opcional (chave privada PEM completa)
   EFI_SANDBOX = 'true',
   EFI_PIX_KEY,
   PROXY_SECRET,
@@ -13,8 +15,15 @@ const {
   PORT = 3000,
 } = process.env;
 
-if (!EFI_CLIENT_ID || !EFI_CLIENT_SECRET || !EFI_CERTIFICATE_BASE64 || !EFI_PIX_KEY || !PROXY_SECRET) {
-  console.error('Missing required env vars');
+if (!EFI_CLIENT_ID || !EFI_CLIENT_SECRET || !EFI_PIX_KEY || !PROXY_SECRET) {
+  console.error('Missing required env vars (EFI_CLIENT_ID, EFI_CLIENT_SECRET, EFI_PIX_KEY, PROXY_SECRET)');
+  process.exit(1);
+}
+
+const hasPem = !!(EFI_CERT_PEM && EFI_KEY_PEM);
+const hasP12 = !!EFI_CERTIFICATE_BASE64;
+if (!hasPem && !hasP12) {
+  console.error('Missing certificate: provide either EFI_CERT_PEM + EFI_KEY_PEM, or EFI_CERTIFICATE_BASE64');
   process.exit(1);
 }
 
@@ -23,8 +32,22 @@ const BASE_URL = isSandbox
   ? 'https://pix-h.api.efipay.com.br'
   : 'https://pix.api.efipay.com.br';
 
-const pfx = Buffer.from(EFI_CERTIFICATE_BASE64, 'base64');
-const agent = new https.Agent({ pfx, passphrase: '' });
+// Normaliza PEM (Render às vezes troca \n literais)
+function normalizePem(s) {
+  return s.includes('\\n') ? s.replace(/\\n/g, '\n') : s;
+}
+
+const agent = hasPem
+  ? new https.Agent({
+      cert: normalizePem(EFI_CERT_PEM),
+      key: normalizePem(EFI_KEY_PEM),
+    })
+  : new https.Agent({
+      pfx: Buffer.from(EFI_CERTIFICATE_BASE64, 'base64'),
+      passphrase: '',
+    });
+
+console.log(`Efí proxy starting (sandbox=${isSandbox}, auth=${hasPem ? 'PEM' : 'P12'})`);
 
 let tokenCache = { token: null, expiresAt: 0 };
 
@@ -55,7 +78,7 @@ function requireSecret(req, res, next) {
   next();
 }
 
-app.get('/', (_, res) => res.json({ ok: true, sandbox: isSandbox }));
+app.get('/', (_, res) => res.json({ ok: true, sandbox: isSandbox, auth: hasPem ? 'PEM' : 'P12' }));
 
 app.post('/pix/create', requireSecret, async (req, res) => {
   try {
@@ -131,4 +154,4 @@ app.post('/webhook/pix', async (req, res) => {
 });
 app.post('/webhook/pix/', (req, res, next) => { req.url = '/webhook/pix'; app.handle(req, res, next); });
 
-app.listen(PORT, () => console.log(`Efí proxy listening on ${PORT} (sandbox=${isSandbox})`));
+app.listen(PORT, () => console.log(`Efí proxy listening on ${PORT}`));
