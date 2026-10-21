@@ -139,7 +139,9 @@ app.get('/pix/status/:txid', requireSecret, async (req, res) => {
 
 app.post('/webhook/pix', async (req, res) => {
   try {
-    console.log('Webhook Efí recebido:', JSON.stringify(req.body).slice(0, 500));
+    // Privacidade: o payload traz nome e CPF/CNPJ do pagador; registra só os identificadores.
+    const txids = (req.body?.pix || []).map((p) => p.txid).filter(Boolean);
+    console.log('Webhook Efí recebido:', { pix: txids.length, txids });
     if (WEBHOOK_FORWARD_URL) {
       await axios.post(WEBHOOK_FORWARD_URL, req.body, {
         headers: { 'X-Proxy-Secret': PROXY_SECRET, 'Content-Type': 'application/json' },
