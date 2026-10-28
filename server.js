@@ -1,6 +1,7 @@
 import express from 'express';
 import https from 'https';
 import axios from 'axios';
+import { verifyWebhookPix, summarizeCob, isValidTxid } from './webhook-verify.js';
 
 const {
   EFI_CLIENT_ID,
@@ -105,16 +106,32 @@ app.post('/pix/create', requireSecret, async (req, res) => {
       { httpsAgent: agent, headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } }
     );
 
-    const { data: qr } = await axios.get(
-      `${BASE_URL}/v2/loc/${charge.loc.id}/qrcode`,
-      { httpsAgent: agent, headers: { Authorization: `Bearer ${token}` } }
-    );
+    // A Efí já devolve o "copia e cola" na própria cobrança. A imagem vem de
+    // uma segunda chamada (/loc/:id/qrcode); se ela falhar, não derrubamos a
+    // cobrança — o app gera o QR a partir do copia e cola.
+    let qrText = charge.pixCopiaECola || null;
+    let qrImage = null;
+    if (charge.loc?.id) {
+      try {
+        const { data: qr } = await axios.get(
+          `${BASE_URL}/v2/loc/${charge.loc.id}/qrcode`,
+          { httpsAgent: agent, headers: { Authorization: `Bearer ${token}` } }
+        );
+        qrText = qr.qrcode || qrText;
+        qrImage = qr.imagemQrcode || null;
+      } catch (e) {
+        console.error('qrcode fetch error:', e.response?.data || e.message);
+      }
+    }
+    if (!qrText) {
+      return res.status(502).json({ error: 'create_failed', detail: 'Efí não retornou o código PIX' });
+    }
 
     res.json({
       txid: charge.txid,
       status: charge.status,
-      qr_code_text: qr.qrcode,
-      qr_code_image: qr.imagemQrcode,
+      qr_code_text: qrText,
+      qr_code_image: qrImage,
       expires_at: new Date(Date.now() + expires_seconds * 1000).toISOString(),
     });
   } catch (err) {
@@ -123,35 +140,57 @@ app.post('/pix/create', requireSecret, async (req, res) => {
   }
 });
 
+// Consulta a cobrança na Efí. Usado pelo status e pela verificação do webhook.
+async function fetchCob(txid) {
+  const token = await getAccessToken();
+  const { data } = await axios.get(
+    `${BASE_URL}/v2/cob/${txid}`,
+    { httpsAgent: agent, headers: { Authorization: `Bearer ${token}` }, timeout: 10_000 }
+  );
+  return data;
+}
+
 app.get('/pix/status/:txid', requireSecret, async (req, res) => {
+  if (!isValidTxid(req.params.txid)) return res.status(400).json({ error: 'invalid_txid' });
   try {
-    const token = await getAccessToken();
-    const { data } = await axios.get(
-      `${BASE_URL}/v2/cob/${req.params.txid}`,
-      { httpsAgent: agent, headers: { Authorization: `Bearer ${token}` } }
-    );
-    res.json({ txid: data.txid, status: data.status, paid_at: data.pix?.[0]?.horario || null });
+    // paid_cents/original_cents: o webhook do app confere o valor pago contra a cobrança.
+    res.json(summarizeCob(await fetchCob(req.params.txid)));
   } catch (err) {
     console.error('status error:', err.response?.data || err.message);
     res.status(500).json({ error: 'status_failed' });
   }
 });
 
+// Público (a Efí não manda o X-Proxy-Secret), então NADA do corpo é confiável:
+// cada txid é conferido na Efí e só o que está CONCLUIDA é repassado ao app,
+// montado a partir da resposta da Efí (ver webhook-verify.js).
 app.post('/webhook/pix', async (req, res) => {
   try {
+    const { verified, rejected, errors } = await verifyWebhookPix(req.body?.pix, fetchCob);
     // Privacidade: o payload traz nome e CPF/CNPJ do pagador; registra só os identificadores.
-    const txids = (req.body?.pix || []).map((p) => p.txid).filter(Boolean);
-    console.log('Webhook Efí recebido:', { pix: txids.length, txids });
-    if (WEBHOOK_FORWARD_URL) {
-      await axios.post(WEBHOOK_FORWARD_URL, req.body, {
-        headers: { 'X-Proxy-Secret': PROXY_SECRET, 'Content-Type': 'application/json' },
-        timeout: 10_000,
-      }).catch(e => console.error('forward error:', e.message));
+    console.log('Webhook Efí recebido:', {
+      verified: verified.map((p) => p.txid),
+      rejected,
+      errors,
+    });
+
+    if (verified.length > 0 && WEBHOOK_FORWARD_URL) {
+      try {
+        await axios.post(WEBHOOK_FORWARD_URL, { pix: verified }, {
+          headers: { 'X-Proxy-Secret': PROXY_SECRET, 'Content-Type': 'application/json' },
+          timeout: 10_000,
+        });
+      } catch (e) {
+        // Erro em vez de 200: a Efí reenvia o webhook (o processamento é idempotente).
+        console.error('forward error:', e.message);
+        return res.status(502).json({ received: false });
+      }
     }
+    if (errors.length > 0) return res.status(502).json({ received: false });
     res.json({ received: true });
   } catch (err) {
     console.error('webhook error:', err.message);
-    res.json({ received: true });
+    res.status(500).json({ received: false });
   }
 });
 app.post('/webhook/pix/', (req, res, next) => { req.url = '/webhook/pix'; app.handle(req, res, next); });
